@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     GCS_BUCKET_NAME: str = "visiontutor-session-logs"
 
     # Gemini model identifier
-    GEMINI_MODEL: str = "gemini-2.0-flash-live-001"
+    GEMINI_MODEL: str = "gemini-2.5-flash-native-audio-latest"
 
     # Server settings
     HOST: str = "0.0.0.0"

@@ -46,15 +46,6 @@ class GeminiLiveSession:
         on_interrupted: Callable[[], Awaitable[None]],
         subject: str = "General",
     ):
-        """
-        Args:
-            on_audio: Callback when audio response bytes are received.
-            on_input_transcript: Callback when user speech transcription arrives.
-            on_output_transcript: Callback when Nova's speech transcription arrives.
-            on_turn_complete: Callback when Nova finishes a response turn.
-            on_interrupted: Callback when barge-in interruption occurs.
-            subject: The subject area selected by the student.
-        """
         self._on_audio = on_audio
         self._on_input_transcript = on_input_transcript
         self._on_output_transcript = on_output_transcript
@@ -64,19 +55,18 @@ class GeminiLiveSession:
 
         self._client = genai.Client(api_key=settings.GOOGLE_API_KEY)
         self._session = None
+        self._session_cm = None  # Async context manager for the live connection
         self._receive_task: Optional[asyncio.Task] = None
         self._running = False
 
     async def connect(self):
         """Establish a live session with Gemini."""
-        # Build the system instruction with subject context
         system_instruction = (
             f"{NOVA_SYSTEM_INSTRUCTION}\n\n"
             f"The student is currently studying: {self._subject}. "
             f"Tailor your explanations to this subject area."
         )
 
-        # Configure the Live API session
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=types.Content(
@@ -88,10 +78,14 @@ class GeminiLiveSession:
 
         logger.info("Connecting to Gemini Live API (model: %s)...", settings.GEMINI_MODEL)
 
-        self._session = await self._client.aio.live.connect(
+        # client.aio.live.connect() returns an async context manager.
+        # We call __aenter__() manually so we can manage the session
+        # lifecycle ourselves (disconnect when WebSocket closes).
+        self._session_cm = self._client.aio.live.connect(
             model=settings.GEMINI_MODEL,
             config=config,
         )
+        self._session = await self._session_cm.__aenter__()
         self._running = True
 
         # Start the background receiver loop
@@ -150,19 +144,21 @@ class GeminiLiveSession:
                             await self._on_audio(part.inline_data.data)
 
                 # ── User speech transcription ──
-                if content.input_transcription and content.input_transcription.text:
-                    await self._on_input_transcript(content.input_transcription.text)
+                input_tx = getattr(content, 'input_transcription', None)
+                if input_tx and getattr(input_tx, 'text', None):
+                    await self._on_input_transcript(input_tx.text)
 
                 # ── Nova's speech transcription ──
-                if content.output_transcription and content.output_transcription.text:
-                    await self._on_output_transcript(content.output_transcription.text)
+                output_tx = getattr(content, 'output_transcription', None)
+                if output_tx and getattr(output_tx, 'text', None):
+                    await self._on_output_transcript(output_tx.text)
 
                 # ── Turn complete (Nova finished speaking) ──
-                if content.turn_complete:
+                if getattr(content, 'turn_complete', False):
                     await self._on_turn_complete()
 
                 # ── Barge-in / interruption ──
-                if content.interrupted:
+                if getattr(content, 'interrupted', False):
                     await self._on_interrupted()
 
         except asyncio.CancelledError:
@@ -183,12 +179,13 @@ class GeminiLiveSession:
             except asyncio.CancelledError:
                 pass
 
-        if self._session:
+        if self._session_cm:
             try:
-                await self._session.close()
+                await self._session_cm.__aexit__(None, None, None)
             except Exception as e:
                 logger.warning("Error closing Gemini session: %s", e)
             self._session = None
+            self._session_cm = None
 
         logger.info("Gemini Live session disconnected.")
 
