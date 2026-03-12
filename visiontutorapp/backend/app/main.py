@@ -1,23 +1,28 @@
 """
-VisionTutor — FastAPI Application
+AskNovaAI — FastAPI Application
 Main entry point with WebSocket endpoint for real-time AI tutoring.
 
 Architecture:
   Browser ←WebSocket→ FastAPI ←Live API→ Gemini
   
-  Messages (JSON over WebSocket):
+  Messages (mixed binary + JSON over WebSocket):
     Client → Server:
-      { "type": "audio",   "data": "<base64 PCM 16-bit 16kHz>" }
-      { "type": "image",   "data": "<base64 JPEG>" }
-      { "type": "config",  "subject": "Math" }
+      BINARY frame     → raw PCM 16-bit 16kHz audio
+      JSON text frame  → { "type": "image",  "data": "<base64 JPEG>" }
+      JSON text frame  → { "type": "config", "subject": "Math" }
 
     Server → Client:
-      { "type": "audio",            "data": "<base64 PCM 16-bit 24kHz>" }
-      { "type": "input_transcript",  "text": "user said..." }
-      { "type": "output_transcript", "text": "Nova said..." }
-      { "type": "turn_complete" }
-      { "type": "interrupted" }
-      { "type": "error",            "message": "..." }
+      BINARY frame     → raw PCM 16-bit 24kHz audio response
+      JSON text frame  → { "type": "input_transcript",  "text": "..." }
+      JSON text frame  → { "type": "output_transcript", "text": "..." }
+      JSON text frame  → { "type": "turn_complete" }
+      JSON text frame  → { "type": "interrupted" }
+      JSON text frame  → { "type": "error", "message": "..." }
+
+  Latency optimisations:
+    - Binary frames for audio (no base64 → 33% less data)
+    - Audio messages always processed before images
+    - uvloop event loop for faster async I/O
 """
 
 import asyncio
@@ -28,10 +33,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
 
 from app.config import settings
 from app.gemini_client import GeminiLiveSession
-from app.audio_utils import pcm_to_base64, base64_to_pcm
 
 # ── Logging ──
 logging.basicConfig(
@@ -45,20 +50,20 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown."""
-    logger.info("VisionTutor backend starting up...")
+    logger.info("AskNovaAI backend starting up...")
     logger.info("Gemini model: %s", settings.GEMINI_MODEL)
     # Validate that API key is set
     if not settings.GOOGLE_API_KEY:
         logger.warning("⚠️  GOOGLE_API_KEY is not set! Gemini sessions will fail.")
     yield
-    logger.info("VisionTutor backend shutting down.")
+    logger.info("AskNovaAI backend shutting down.")
 
 
 # ── FastAPI App ──
 app = FastAPI(
-    title="VisionTutor API",
+    title="AskNovaAI API",
     description="Real-time AI tutoring powered by Gemini Live API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -76,10 +81,10 @@ app.add_middleware(
 # ── Health Check ──
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint for Cloud Run."""
+    """Health check endpoint."""
     return {
         "status": "healthy",
-        "service": "VisionTutor Backend",
+        "service": "AskNovaAI Backend",
         "model": settings.GEMINI_MODEL,
         "api_key_set": bool(settings.GOOGLE_API_KEY),
     }
@@ -91,9 +96,8 @@ async def websocket_tutor(ws: WebSocket):
     """
     Main WebSocket endpoint for real-time tutoring sessions.
     
-    Each WebSocket connection creates a dedicated Gemini Live session.
-    The client sends audio chunks and camera frames; the server
-    streams back audio responses and transcriptions.
+    Audio is sent as BINARY frames (raw PCM) for minimal latency.
+    Control messages (config, transcript, turn signals) use JSON text frames.
     """
     await ws.accept()
     logger.info("WebSocket client connected.")
@@ -105,150 +109,135 @@ async def websocket_tutor(ws: WebSocket):
     async def send_json_safe(data: dict):
         """Send JSON to WebSocket, catching errors if closed."""
         try:
-            await ws.send_json(data)
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_json(data)
         except Exception:
             pass  # Client may have disconnected
 
+    # ── Helper to send binary safely ──
+    async def send_bytes_safe(data: bytes):
+        """Send binary frame to WebSocket, catching errors if closed."""
+        try:
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.send_bytes(data)
+        except Exception:
+            pass
+
     # ── Gemini callback: audio response received ──
     async def on_audio(audio_data: bytes):
-        """Forward audio response bytes to the client as base64."""
-        await send_json_safe({
-            "type": "audio",
-            "data": pcm_to_base64(audio_data),
-        })
+        """Forward audio response bytes to the client as binary frame."""
+        await send_bytes_safe(audio_data)
 
     # ── Gemini callback: user speech transcription ──
     async def on_input_transcript(text: str):
-        """Forward user speech transcription to the client."""
-        await send_json_safe({
-            "type": "input_transcript",
-            "text": text,
-        })
+        await send_json_safe({"type": "input_transcript", "text": text})
 
     # ── Gemini callback: Nova's speech transcription ──
     async def on_output_transcript(text: str):
-        """Forward Nova's speech transcription to the client."""
-        await send_json_safe({
-            "type": "output_transcript",
-            "text": text,
-        })
+        await send_json_safe({"type": "output_transcript", "text": text})
 
     # ── Gemini callback: turn complete ──
     async def on_turn_complete():
-        """Notify client that Nova finished speaking."""
         await send_json_safe({"type": "turn_complete"})
 
     # ── Gemini callback: interrupted (barge-in) ──
     async def on_interrupted():
-        """Notify client that Nova was interrupted."""
         await send_json_safe({"type": "interrupted"})
+
+    async def create_and_connect_session():
+        """Create a new Gemini session and connect it."""
+        nonlocal gemini_session
+        gemini_session = GeminiLiveSession(
+            on_audio=on_audio,
+            on_input_transcript=on_input_transcript,
+            on_output_transcript=on_output_transcript,
+            on_turn_complete=on_turn_complete,
+            on_interrupted=on_interrupted,
+            subject=subject,
+        )
+        await gemini_session.connect()
+        await send_json_safe({"type": "connected"})
+        logger.info("Gemini session connected for subject: %s", subject)
 
     try:
         # Wait for the first message to set up the session
-        # (could be a config message with subject, or audio right away)
         while True:
             try:
-                raw = await ws.receive_text()
-                message = json.loads(raw)
+                message = await ws.receive()
             except WebSocketDisconnect:
                 logger.info("WebSocket disconnected before session start.")
                 return
-            except json.JSONDecodeError:
-                await send_json_safe({"type": "error", "message": "Invalid JSON"})
-                continue
 
-            msg_type = message.get("type", "")
-
-            # ── Config message: set subject before connecting ──
-            if msg_type == "config":
-                subject = message.get("subject", "General")
-                logger.info("Subject set to: %s", subject)
-
-                # Create and connect the Gemini session
-                gemini_session = GeminiLiveSession(
-                    on_audio=on_audio,
-                    on_input_transcript=on_input_transcript,
-                    on_output_transcript=on_output_transcript,
-                    on_turn_complete=on_turn_complete,
-                    on_interrupted=on_interrupted,
-                    subject=subject,
-                )
-
-                try:
-                    await gemini_session.connect()
-                    await send_json_safe({"type": "connected"})
-                    logger.info("Gemini session connected for subject: %s", subject)
-                    break  # Move to the main message loop
-                except Exception as e:
-                    logger.error("Failed to connect Gemini session: %s", e, exc_info=True)
-                    await send_json_safe({
-                        "type": "error",
-                        "message": f"Failed to connect to AI tutor: {str(e)}",
-                    })
-                    return
-
-            # ── If audio comes before config, connect with defaults ──
-            elif msg_type in ("audio", "image"):
-                gemini_session = GeminiLiveSession(
-                    on_audio=on_audio,
-                    on_input_transcript=on_input_transcript,
-                    on_output_transcript=on_output_transcript,
-                    on_turn_complete=on_turn_complete,
-                    on_interrupted=on_interrupted,
-                    subject=subject,
-                )
-
-                try:
-                    await gemini_session.connect()
-                    await send_json_safe({"type": "connected"})
-                except Exception as e:
-                    logger.error("Failed to connect Gemini session: %s", e, exc_info=True)
-                    await send_json_safe({
-                        "type": "error",
-                        "message": f"Failed to connect to AI tutor: {str(e)}",
-                    })
-                    return
-
-                # Process this first audio/image message
-                if msg_type == "audio" and message.get("data"):
-                    pcm_bytes = base64_to_pcm(message["data"])
-                    await gemini_session.send_audio(pcm_bytes)
-                elif msg_type == "image" and message.get("data"):
-                    jpeg_bytes = base64.b64decode(message["data"])
-                    await gemini_session.send_image(jpeg_bytes)
+            # ── Binary frame = raw PCM audio ──
+            if "bytes" in message and message["bytes"]:
+                # Audio came before config — connect with defaults then process
+                await create_and_connect_session()
+                await gemini_session.send_audio(message["bytes"])
                 break
+
+            # ── Text frame = JSON control message ──
+            if "text" in message and message["text"]:
+                try:
+                    data = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    await send_json_safe({"type": "error", "message": "Invalid JSON"})
+                    continue
+
+                msg_type = data.get("type", "")
+
+                if msg_type == "config":
+                    subject = data.get("subject", "General")
+                    logger.info("Subject set to: %s", subject)
+                    try:
+                        await create_and_connect_session()
+                        break
+                    except Exception as e:
+                        logger.error("Failed to connect Gemini: %s", e, exc_info=True)
+                        await send_json_safe({
+                            "type": "error",
+                            "message": f"Failed to connect to AI tutor: {str(e)}",
+                        })
+                        return
+
+                elif msg_type == "image" and data.get("data"):
+                    # Image came before config — connect with defaults
+                    await create_and_connect_session()
+                    jpeg_bytes = base64.b64decode(data["data"])
+                    await gemini_session.send_image(jpeg_bytes)
+                    break
 
         # ── Main message loop ──
         while gemini_session and gemini_session.is_connected:
             try:
-                raw = await ws.receive_text()
-                message = json.loads(raw)
+                message = await ws.receive()
             except WebSocketDisconnect:
                 logger.info("WebSocket disconnected.")
                 break
-            except json.JSONDecodeError:
-                await send_json_safe({"type": "error", "message": "Invalid JSON"})
+
+            # ── Binary frame = raw PCM audio (highest priority) ──
+            if "bytes" in message and message["bytes"]:
+                await gemini_session.send_audio(message["bytes"])
                 continue
 
-            msg_type = message.get("type", "")
+            # ── Text frame = JSON (image, config) ──
+            if "text" in message and message["text"]:
+                try:
+                    data = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    await send_json_safe({"type": "error", "message": "Invalid JSON"})
+                    continue
 
-            if msg_type == "audio" and message.get("data"):
-                # Decode base64 audio and forward to Gemini
-                pcm_bytes = base64_to_pcm(message["data"])
-                await gemini_session.send_audio(pcm_bytes)
+                msg_type = data.get("type", "")
 
-            elif msg_type == "image" and message.get("data"):
-                # Decode base64 JPEG frame and forward to Gemini
-                jpeg_bytes = base64.b64decode(message["data"])
-                await gemini_session.send_image(jpeg_bytes)
+                if msg_type == "image" and data.get("data"):
+                    jpeg_bytes = base64.b64decode(data["data"])
+                    await gemini_session.send_image(jpeg_bytes)
 
-            elif msg_type == "config":
-                # Subject change mid-session (not supported by Live API,
-                # but we log it for transcript purposes)
-                new_subject = message.get("subject", subject)
-                if new_subject != subject:
-                    subject = new_subject
-                    logger.info("Subject changed to: %s", subject)
+                elif msg_type == "config":
+                    new_subject = data.get("subject", subject)
+                    if new_subject != subject:
+                        subject = new_subject
+                        logger.info("Subject changed to: %s", subject)
 
     except Exception as e:
         logger.error("Unexpected error in WebSocket handler: %s", e, exc_info=True)
@@ -274,4 +263,6 @@ if __name__ == "__main__":
         port=settings.PORT,
         reload=True,
         log_level="info",
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
     )

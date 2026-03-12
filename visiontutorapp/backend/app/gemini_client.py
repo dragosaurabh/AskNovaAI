@@ -1,5 +1,5 @@
 """
-VisionTutor — Gemini Live API Client
+AskNovaAI — Gemini Live API Client
 Manages bidirectional audio/vision sessions with Gemini 2.0 Flash Live.
 Uses the Google GenAI SDK (google-genai) for all API interactions.
 
@@ -8,6 +8,11 @@ Architecture:
   - Audio: PCM 16-bit 16kHz in → PCM 16-bit 24kHz out
   - Video: JPEG frames sent alongside audio for multimodal understanding
   - Supports barge-in (interruption) via the Live API's built-in VAD
+
+Latency optimisations:
+  - VAD with silence_duration_ms=300 → Gemini starts responding after 300ms silence
+  - speech_config with prebuilt voice for consistent low-latency synthesis
+  - Audio-only response_modalities (no text generation overhead)
 """
 
 import asyncio
@@ -25,10 +30,24 @@ logger = logging.getLogger(__name__)
 # Nova's system instruction — the AI tutor persona
 # ──────────────────────────────────────────────
 NOVA_SYSTEM_INSTRUCTION = """You are Nova, a warm and patient AI tutor. The student will show \
-you their homework or study material using their camera. You can SEE what they are showing you. \
-Explain concepts clearly, step-by-step, at their level. Encourage them when they get things right. \
-When interrupted, stop immediately and address their new question. Keep explanations concise — \
-no more than 3 sentences before pausing for the student to respond."""
+you their homework or study material using their camera or screen share. You can SEE what they \
+are showing you. Explain concepts clearly, step-by-step, at their level. Encourage them when \
+they get things right. When interrupted, stop immediately and address their new question. Keep \
+explanations concise — no more than 3 sentences before pausing for the student to respond."""
+
+# Subject-specific teaching style extensions
+SUBJECT_PROMPTS = {
+    "Math": "Focus on step-by-step problem solving. Always show your working. "
+            "Walk through each equation transformation clearly.",
+    "Science": "Use analogies and real-world examples. Draw connections to everyday life. "
+               "Explain the 'why' behind phenomena.",
+    "History": "Provide context and cause-effect relationships. Make it a story. "
+               "Connect events to broader patterns and their modern relevance.",
+    "Coding": "Explain code line by line. Suggest improvements and best practices. "
+              "Point out potential bugs and teach debugging strategies.",
+    "Other": "Be a general helpful tutor across any subject. Adapt your teaching "
+             "style to what the student is working on.",
+}
 
 
 class GeminiLiveSession:
@@ -61,9 +80,11 @@ class GeminiLiveSession:
 
     async def connect(self):
         """Establish a live session with Gemini."""
+        subject_prompt = SUBJECT_PROMPTS.get(self._subject, SUBJECT_PROMPTS["Other"])
         system_instruction = (
             f"{NOVA_SYSTEM_INSTRUCTION}\n\n"
             f"The student is currently studying: {self._subject}. "
+            f"{subject_prompt}\n"
             f"Tailor your explanations to this subject area."
         )
 
@@ -74,6 +95,24 @@ class GeminiLiveSession:
             ),
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
+            # ── Voice configuration for consistent, fast synthesis ──
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Aoede"
+                    )
+                )
+            ),
+            # ── VAD tuning for minimal response latency ──
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=20,
+                    silence_duration_ms=300,
+                )
+            ),
         )
 
         logger.info("Connecting to Gemini Live API (model: %s)...", settings.GEMINI_MODEL)

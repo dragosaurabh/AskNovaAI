@@ -1,11 +1,11 @@
 /**
- * useWebSocket — Manages the WebSocket connection to the VisionTutor backend.
- * 
+ * useWebSocket — Manages the WebSocket connection to the AskNovaAI backend.
+ *
  * Features:
+ * - Binary frames for audio (no base64 overhead — 33% less data)
+ * - JSON text frames for control messages
  * - Auto-reconnect with exponential backoff
- * - JSON message parsing and routing
- * - Connection state tracking
- * - Graceful disconnect
+ * - Latency tracking (time from user-stops-speaking → first audio chunk)
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
@@ -16,6 +16,7 @@ const INITIAL_RECONNECT_DELAY = 1000;
 export default function useWebSocket() {
   const [connectionState, setConnectionState] = useState('disconnected');
   // disconnected | connecting | connected | error
+  const [latencyMs, setLatencyMs] = useState(null);
 
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
@@ -23,12 +24,22 @@ export default function useWebSocket() {
   const handlersRef = useRef({});
   const intentionalCloseRef = useRef(false);
 
+  // Latency tracking
+  const speechEndTimeRef = useRef(null);
+  const latencySamplesRef = useRef([]);
+
   /**
    * Register message handlers.
-   * handlers: { onAudio, onInputTranscript, onOutputTranscript, onTurnComplete, onInterrupted, onError, onConnected }
    */
   const setHandlers = useCallback((handlers) => {
     handlersRef.current = handlers;
+  }, []);
+
+  /**
+   * Mark when user stops speaking (for latency measurement).
+   */
+  const markSpeechEnd = useCallback(() => {
+    speechEndTimeRef.current = performance.now();
   }, []);
 
   /**
@@ -46,26 +57,45 @@ export default function useWebSocket() {
 
     const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/tutor';
     const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer'; // Receive binary as ArrayBuffer
     wsRef.current = ws;
 
     ws.onopen = () => {
       reconnectDelayRef.current = INITIAL_RECONNECT_DELAY;
-      // Send config message with the selected subject
+      // Send config message with the selected subject (JSON)
       ws.send(JSON.stringify({ type: 'config', subject }));
     };
 
     ws.onmessage = (event) => {
+      const handlers = handlersRef.current;
+
+      // ── Binary frame = raw PCM audio from Nova ──
+      if (event.data instanceof ArrayBuffer) {
+        // Measure latency: time from user stopped speaking to first audio chunk
+        if (speechEndTimeRef.current) {
+          const latency = Math.round(performance.now() - speechEndTimeRef.current);
+          speechEndTimeRef.current = null;
+
+          // Rolling average of last 5 samples
+          const samples = latencySamplesRef.current;
+          samples.push(latency);
+          if (samples.length > 5) samples.shift();
+          const avg = Math.round(samples.reduce((a, b) => a + b, 0) / samples.length);
+          setLatencyMs(avg);
+        }
+
+        handlers.onAudio?.(event.data);
+        return;
+      }
+
+      // ── Text frame = JSON control message ──
       try {
         const message = JSON.parse(event.data);
-        const handlers = handlersRef.current;
 
         switch (message.type) {
           case 'connected':
             setConnectionState('connected');
             handlers.onConnected?.();
-            break;
-          case 'audio':
-            handlers.onAudio?.(message.data);
             break;
           case 'input_transcript':
             handlers.onInputTranscript?.(message.text);
@@ -99,7 +129,6 @@ export default function useWebSocket() {
 
       if (!intentionalCloseRef.current) {
         setConnectionState('disconnected');
-        // Auto-reconnect with exponential backoff
         const delay = reconnectDelayRef.current;
         reconnectTimeoutRef.current = setTimeout(() => {
           reconnectDelayRef.current = Math.min(delay * 2, MAX_RECONNECT_DELAY);
@@ -112,11 +141,21 @@ export default function useWebSocket() {
   }, []);
 
   /**
-   * Send a message over the WebSocket.
+   * Send a JSON control message (config, image).
    */
   const send = useCallback((data) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(typeof data === 'string' ? data : JSON.stringify(data));
+    }
+  }, []);
+
+  /**
+   * Send raw binary audio data (ArrayBuffer or TypedArray).
+   * Avoids base64 encoding — 33% less data over the wire.
+   */
+  const sendBinary = useCallback((data) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(data);
     }
   }, []);
 
@@ -134,6 +173,8 @@ export default function useWebSocket() {
       wsRef.current = null;
     }
     setConnectionState('disconnected');
+    setLatencyMs(null);
+    latencySamplesRef.current = [];
   }, []);
 
   // Cleanup on unmount
@@ -151,9 +192,12 @@ export default function useWebSocket() {
 
   return {
     connectionState,
+    latencyMs,
     connect,
     disconnect,
     send,
+    sendBinary,
     setHandlers,
+    markSpeechEnd,
   };
 }

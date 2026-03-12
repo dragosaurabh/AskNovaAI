@@ -1,11 +1,13 @@
 /**
  * useAudio — Captures microphone audio as PCM 16-bit 16kHz and plays back
- * audio response chunks from Nova.
+ * audio response chunks from Nova using Web Audio API.
  *
- * Features:
- * - Mic capture via Web Audio API → PCM 16-bit 16kHz chunks
- * - Audio playback queue for smooth Nova responses
- * - Barge-in support (stops playback when user speaks)
+ * Latency optimisations:
+ * - Sends raw PCM ArrayBuffer (no base64 encoding)
+ * - Accepts raw ArrayBuffer for playback (no base64 decoding)
+ * - 100ms capture chunks for fast streaming to Gemini
+ * - Web Audio API playback with precise scheduling (no HTML audio elements)
+ * - 24kHz output sample rate matching Gemini's output
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
@@ -24,12 +26,13 @@ export default function useAudio({ onAudioChunk }) {
   const mediaStreamRef = useRef(null);
   const processorRef = useRef(null);
   const playbackContextRef = useRef(null);
-  const playbackQueueRef = useRef([]);
-  const isPlayingRef = useRef(false);
   const nextPlayTimeRef = useRef(0);
+  const isPlayingRef = useRef(false);
+  const activeSourcesRef = useRef(new Set());
 
   /**
    * Start capturing microphone audio.
+   * Sends raw PCM Int16 ArrayBuffer via onAudioChunk.
    */
   const startRecording = useCallback(async () => {
     try {
@@ -47,7 +50,7 @@ export default function useAudio({ onAudioChunk }) {
       });
       mediaStreamRef.current = stream;
 
-      // Create AudioContext for capture
+      // Create AudioContext for capture at 16kHz
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: INPUT_SAMPLE_RATE,
       });
@@ -55,24 +58,19 @@ export default function useAudio({ onAudioChunk }) {
 
       const source = audioContext.createMediaStreamSource(stream);
 
-      // Use ScriptProcessorNode for PCM capture
-      // (AudioWorklet is preferred but ScriptProcessor works cross-browser)
-      const bufferSize = Math.round(INPUT_SAMPLE_RATE * CHUNK_DURATION_MS / 1000);
-      const processor = audioContext.createScriptProcessor(
-        // Buffer size must be power of 2
-        Math.pow(2, Math.ceil(Math.log2(bufferSize))),
-        1, // input channels
-        1  // output channels
+      // Buffer size: power of 2 closest to 100ms at 16kHz
+      const bufferSize = Math.pow(
+        2,
+        Math.ceil(Math.log2(INPUT_SAMPLE_RATE * CHUNK_DURATION_MS / 1000))
       );
+      const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
       processorRef.current = processor;
 
       processor.onaudioprocess = (event) => {
         const inputData = event.inputBuffer.getChannelData(0);
-        // Convert Float32 samples to PCM 16-bit
+        // Convert Float32 → PCM 16-bit and send as raw ArrayBuffer
         const pcm16 = float32ToPCM16(inputData);
-        // Convert to base64 and send
-        const base64 = arrayBufferToBase64(pcm16.buffer);
-        onAudioChunk?.(base64);
+        onAudioChunk?.(pcm16.buffer);
       };
 
       source.connect(processor);
@@ -111,11 +109,11 @@ export default function useAudio({ onAudioChunk }) {
   }, []);
 
   /**
-   * Play a base64-encoded PCM audio chunk from Nova.
-   * Chunks are queued and played sequentially for smooth output.
+   * Play a raw PCM audio chunk from Nova (ArrayBuffer).
+   * Chunks are scheduled sequentially using Web Audio API for gapless playback.
    */
-  const playAudioChunk = useCallback((base64Data) => {
-    // Initialize playback context if needed
+  const playAudioChunk = useCallback((arrayBuffer) => {
+    // Initialize playback context if needed (24kHz to match Gemini output)
     if (!playbackContextRef.current) {
       playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: OUTPUT_SAMPLE_RATE,
@@ -124,29 +122,35 @@ export default function useAudio({ onAudioChunk }) {
     }
 
     const ctx = playbackContextRef.current;
-    const pcmBytes = base64ToArrayBuffer(base64Data);
-    const float32 = pcm16ToFloat32(new Int16Array(pcmBytes));
 
-    // Create audio buffer
+    // Convert raw PCM bytes to Float32 for Web Audio
+    const int16 = new Int16Array(arrayBuffer);
+    const float32 = pcm16ToFloat32(int16);
+
+    // Create audio buffer and fill with sample data
     const audioBuffer = ctx.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
     audioBuffer.getChannelData(0).set(float32);
 
-    // Schedule playback
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(ctx.destination);
+    // Schedule playback with precise timing (no gaps)
+    const sourceNode = ctx.createBufferSource();
+    sourceNode.buffer = audioBuffer;
+    sourceNode.connect(ctx.destination);
 
     const now = ctx.currentTime;
     const startTime = Math.max(now, nextPlayTimeRef.current);
-    source.start(startTime);
+    sourceNode.start(startTime);
     nextPlayTimeRef.current = startTime + audioBuffer.duration;
+
+    // Track active sources for interruption support
+    activeSourcesRef.current.add(sourceNode);
 
     if (!isPlayingRef.current) {
       isPlayingRef.current = true;
       setIsPlaying(true);
     }
 
-    source.onended = () => {
+    sourceNode.onended = () => {
+      activeSourcesRef.current.delete(sourceNode);
       // Check if this was the last scheduled buffer
       if (ctx.currentTime >= nextPlayTimeRef.current - 0.05) {
         isPlayingRef.current = false;
@@ -156,9 +160,20 @@ export default function useAudio({ onAudioChunk }) {
   }, []);
 
   /**
-   * Stop all audio playback (for barge-in).
+   * Immediately stop all audio playback (for barge-in / interruption).
+   * Stops all currently scheduled audio sources.
    */
   const stopPlayback = useCallback(() => {
+    // Stop all active source nodes immediately
+    for (const source of activeSourcesRef.current) {
+      try {
+        source.stop(0);
+      } catch {
+        // Already stopped
+      }
+    }
+    activeSourcesRef.current.clear();
+
     if (playbackContextRef.current) {
       playbackContextRef.current.close();
       playbackContextRef.current = null;
@@ -210,28 +225,4 @@ function pcm16ToFloat32(int16Array) {
     float32Array[i] = int16Array[i] / (int16Array[i] < 0 ? 0x8000 : 0x7FFF);
   }
   return float32Array;
-}
-
-/**
- * Convert an ArrayBuffer to a base64 string.
- */
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-/**
- * Convert a base64 string to an ArrayBuffer.
- */
-function base64ToArrayBuffer(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
 }

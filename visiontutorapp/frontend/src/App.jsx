@@ -1,8 +1,14 @@
 /**
- * VisionTutor — Main Application Component
- * 
- * Orchestrates the camera, microphone, WebSocket, and UI components
+ * AskNovaAI — Main Application Component
+ *
+ * Orchestrates media input, microphone, WebSocket, and UI components
  * into a unified real-time AI tutoring experience.
+ *
+ * Latency features:
+ * - Binary WebSocket for audio (no base64)
+ * - "Thinking..." state between user speech end and Nova's first audio
+ * - Latency measurement displayed in status bar
+ * - Instant interruption on user speech
  */
 
 import { useState, useCallback, useEffect, useRef } from 'react';
@@ -17,11 +23,13 @@ import MicIndicator from './components/MicIndicator';
 import Transcript from './components/Transcript';
 import SubjectSelector from './components/SubjectSelector';
 import StatusBar from './components/StatusBar';
+import WelcomeScreen from './components/WelcomeScreen';
+import SessionSummary from './components/SessionSummary';
 
 // Hooks
 import useWebSocket from './hooks/useWebSocket';
 import useAudio from './hooks/useAudio';
-import useCamera from './hooks/useCamera';
+import useMedia from './hooks/useMedia';
 
 // Session timeout: 5 minutes of inactivity
 const SESSION_TIMEOUT_MS = 5 * 60 * 1000;
@@ -31,32 +39,47 @@ export default function App() {
   const [subject, setSubject] = useState('Math');
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
+  const [wasInterrupted, setWasInterrupted] = useState(false);
   const [messages, setMessages] = useState([]);
   const [error, setError] = useState(null);
+  const [isMuted, setIsMuted] = useState(false);
+
+  // Session summary state
+  const [showSummary, setShowSummary] = useState(false);
+  const [sessionDuration, setSessionDuration] = useState(0);
+  const [exchangeCount, setExchangeCount] = useState(0);
+  const sessionStartRef = useRef(null);
 
   // Accumulate transcript fragments into complete messages
   const inputBufferRef = useRef('');
   const outputBufferRef = useRef('');
   const timeoutRef = useRef(null);
 
-  // ── Hooks ──
-  const { connectionState, connect, disconnect, send, setHandlers } = useWebSocket();
+  // Refs to avoid circular dependencies
+  const handleEndSessionRef = useRef(null);
+  const resetSessionTimeoutRef = useRef(null);
 
+  // ── Hooks ──
+  const {
+    connectionState, latencyMs, connect, disconnect, send, sendBinary,
+    setHandlers, markSpeechEnd,
+  } = useWebSocket();
+
+  // Audio chunk callback: send raw PCM binary
   const onAudioChunk = useCallback(
-    (base64) => {
-      send({ type: 'audio', data: base64 });
+    (arrayBuffer) => {
+      if (!isMuted) {
+        sendBinary(arrayBuffer);
+      }
     },
-    [send]
+    [sendBinary, isMuted]
   );
 
   const {
-    isRecording,
-    isPlaying,
-    micError,
-    startRecording,
-    stopRecording,
-    playAudioChunk,
-    stopPlayback,
+    isRecording, isPlaying, micError,
+    startRecording, stopRecording, playAudioChunk, stopPlayback,
   } = useAudio({ onAudioChunk });
 
   const onFrame = useCallback(
@@ -67,60 +90,108 @@ export default function App() {
   );
 
   const {
-    videoRef,
-    isActive: cameraActive,
-    cameraError,
-    startCamera,
-    stopCamera,
-  } = useCamera({ onFrame });
+    videoRef, isActive: mediaActive, inputSource, sourceLabel, mediaError,
+    startCamera, startScreen, startVoiceOnly, stopMedia,
+  } = useMedia({ onFrame });
+
+  // ── End session ──
+  const handleEndSession = useCallback(() => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+
+    const duration = sessionStartRef.current
+      ? Math.floor((Date.now() - sessionStartRef.current) / 1000)
+      : 0;
+    setSessionDuration(duration);
+
+    stopRecording();
+    stopMedia();
+    stopPlayback();
+    disconnect();
+    setIsSessionActive(false);
+    setIsSpeaking(false);
+    setIsThinking(false);
+    setIsTyping(false);
+    setIsMuted(false);
+
+    if (exchangeCount > 0 || duration > 5) {
+      setShowSummary(true);
+    }
+  }, [disconnect, stopRecording, stopMedia, stopPlayback, exchangeCount]);
+
+  useEffect(() => { handleEndSessionRef.current = handleEndSession; });
+
+  // ── Session timeout ──
+  const resetSessionTimeout = useCallback(() => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => {
+      handleEndSessionRef.current?.();
+      setError('Session timed out after 5 minutes of inactivity.');
+    }, SESSION_TIMEOUT_MS);
+  }, []);
+
+  useEffect(() => { resetSessionTimeoutRef.current = resetSessionTimeout; });
 
   // ── WebSocket message handlers ──
   useEffect(() => {
     setHandlers({
       onConnected: () => {
         setError(null);
-        resetSessionTimeout();
+        resetSessionTimeoutRef.current?.();
       },
-      onAudio: (data) => {
-        playAudioChunk(data);
+      onAudio: (arrayBuffer) => {
+        playAudioChunk(arrayBuffer);
         setIsSpeaking(true);
-        resetSessionTimeout();
+        setIsThinking(false); // Nova started responding
+        setIsTyping(false);
+        resetSessionTimeoutRef.current?.();
       },
       onInputTranscript: (text) => {
         inputBufferRef.current += text;
-        resetSessionTimeout();
+        // User spoke — mark speech end for latency tracking
+        markSpeechEnd();
+        setIsThinking(true); // User finished speaking, waiting for Nova
+        resetSessionTimeoutRef.current?.();
       },
       onOutputTranscript: (text) => {
         outputBufferRef.current += text;
-        resetSessionTimeout();
+        setIsTyping(true);
+        resetSessionTimeoutRef.current?.();
       },
       onTurnComplete: () => {
         setIsSpeaking(false);
+        setIsThinking(false);
+        setIsTyping(false);
         // Flush output buffer as a Nova message
         if (outputBufferRef.current.trim()) {
           setMessages((prev) => [
             ...prev,
-            { role: 'nova', text: outputBufferRef.current.trim() },
+            { role: 'nova', text: outputBufferRef.current.trim(), timestamp: Date.now() },
           ]);
           outputBufferRef.current = '';
+          setExchangeCount((prev) => prev + 1);
         }
         // Flush input buffer as a user message
         if (inputBufferRef.current.trim()) {
           setMessages((prev) => [
             ...prev,
-            { role: 'user', text: inputBufferRef.current.trim() },
+            { role: 'user', text: inputBufferRef.current.trim(), timestamp: Date.now() },
           ]);
           inputBufferRef.current = '';
         }
       },
       onInterrupted: () => {
         setIsSpeaking(false);
-        stopPlayback();
+        setIsThinking(false);
+        setIsTyping(false);
+        stopPlayback(); // Immediately stop Nova's audio
+        // Flash "Interrupted" briefly
+        setWasInterrupted(true);
+        setTimeout(() => setWasInterrupted(false), 1500);
         // Flush any pending output
         if (outputBufferRef.current.trim()) {
           setMessages((prev) => [
             ...prev,
-            { role: 'nova', text: outputBufferRef.current.trim() + ' [interrupted]' },
+            { role: 'nova', text: outputBufferRef.current.trim() + ' [interrupted]', timestamp: Date.now() },
           ]);
           outputBufferRef.current = '';
         }
@@ -129,123 +200,155 @@ export default function App() {
         setError(msg);
       },
     });
-  }, [setHandlers, playAudioChunk, stopPlayback]);
-
-  // ── Session timeout auto-reconnect ──
-  const resetSessionTimeout = useCallback(() => {
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => {
-      handleEndSession();
-      setError('Session timed out after 5 minutes of inactivity. Click "Talk to Nova" to start a new session.');
-    }, SESSION_TIMEOUT_MS);
-  }, []);
+  }, [setHandlers, playAudioChunk, stopPlayback, markSpeechEnd]);
 
   // ── Start session ──
-  const handleStartSession = useCallback(async () => {
-    setError(null);
-    setMessages([]);
-    inputBufferRef.current = '';
-    outputBufferRef.current = '';
+  const handleStartSession = useCallback(
+    async (source) => {
+      setError(null);
+      setMessages([]);
+      setShowSummary(false);
+      inputBufferRef.current = '';
+      outputBufferRef.current = '';
+      setExchangeCount(0);
+      sessionStartRef.current = Date.now();
 
-    // Start camera and mic
-    await startCamera();
-    await startRecording();
+      if (source === 'camera') {
+        await startCamera();
+      } else if (source === 'screen') {
+        await startScreen();
+      } else {
+        startVoiceOnly();
+      }
 
-    // Connect WebSocket
-    connect(subject);
-    setIsSessionActive(true);
-  }, [subject, connect, startCamera, startRecording]);
+      await startRecording();
+      connect(subject);
+      setIsSessionActive(true);
+    },
+    [subject, connect, startCamera, startScreen, startVoiceOnly, startRecording]
+  );
 
-  // ── End session ──
-  const handleEndSession = useCallback(() => {
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    stopRecording();
-    stopCamera();
-    stopPlayback();
-    disconnect();
-    setIsSessionActive(false);
-    setIsSpeaking(false);
-  }, [disconnect, stopRecording, stopCamera, stopPlayback]);
+  // ── Toggle mute ──
+  const toggleMute = useCallback(() => {
+    setIsMuted((prev) => !prev);
+  }, []);
 
-  // ── Toggle session ──
-  const handleToggleSession = useCallback(() => {
-    if (isSessionActive) {
-      handleEndSession();
-    } else {
-      handleStartSession();
-    }
-  }, [isSessionActive, handleStartSession, handleEndSession]);
+  // ── Keyboard shortcuts ──
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
+      if (e.code === 'Space' && isSessionActive) {
+        e.preventDefault();
+        toggleMute();
+      } else if (e.code === 'Escape' && isSessionActive) {
+        e.preventDefault();
+        handleEndSession();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isSessionActive, toggleMute, handleEndSession]);
 
-  // ── Determine talk button state ──
+  // ── Derived state ──
   const buttonState = isSessionActive
-    ? connectionState === 'connecting'
-      ? 'connecting'
-      : 'active'
+    ? connectionState === 'connecting' ? 'connecting' : 'active'
     : 'idle';
 
-  // ── Display error from mic or camera ──
-  const displayError = error || micError || cameraError;
+  const waveformMode = wasInterrupted
+    ? 'interrupted'
+    : isRecording && !isMuted
+      ? 'user'
+      : isSpeaking || isPlaying
+        ? 'nova'
+        : isThinking
+          ? 'thinking'
+          : 'idle';
+
+  const displayError = error || micError || mediaError;
+  const showWelcome = !isSessionActive && !showSummary;
 
   return (
     <div className="app">
-      {/* ── Header ── */}
+      {/* Header */}
       <header className="app-header">
         <div className="app-logo">
           <div className="app-logo-icon">✨</div>
-          <span className="app-logo-text">VisionTutor</span>
+          <span className="app-logo-text">AskNovaAI</span>
           <span className="app-logo-badge">AI Tutor</span>
         </div>
         <div className="header-controls">
-          <SubjectSelector
-            value={subject}
-            onChange={setSubject}
-            disabled={isSessionActive}
-          />
+          <SubjectSelector value={subject} onChange={setSubject} disabled={isSessionActive} />
         </div>
       </header>
 
-      {/* ── Error Banner ── */}
+      {/* Error Banner */}
       {displayError && (
         <div className="error-banner">
           <span className="error-banner__icon">⚠️</span>
           <span>{displayError}</span>
-          <button
-            className="error-banner__dismiss"
-            onClick={() => setError(null)}
-            aria-label="Dismiss error"
-          >
-            ✕
-          </button>
+          <button className="error-banner__dismiss" onClick={() => setError(null)} aria-label="Dismiss">✕</button>
         </div>
       )}
 
-      {/* ── Main Content ── */}
-      <main className="main-content">
-        {/* Left: Camera + Controls */}
-        <div className="camera-section">
-          <CameraPreview ref={videoRef} isActive={cameraActive} />
-
-          <div className="controls-bar">
-            <MicIndicator isActive={isRecording} />
-            <TalkButton state={buttonState} onClick={handleToggleSession} />
-            <WaveformVisualizer isActive={isSpeaking || isPlaying} />
+      {/* Main Content */}
+      {showWelcome ? (
+        <WelcomeScreen onSelectSource={handleStartSession} disabled={connectionState === 'connecting'} />
+      ) : (
+        <main className="main-content">
+          <div className="camera-section">
+            <CameraPreview
+              ref={videoRef}
+              isActive={mediaActive}
+              inputSource={inputSource}
+              sourceLabel={sourceLabel}
+              mediaError={mediaError}
+            />
+            <div className="controls-bar">
+              <MicIndicator isActive={isRecording && !isMuted} />
+              <TalkButton state={buttonState} onClick={isSessionActive ? handleEndSession : () => {}} />
+              <WaveformVisualizer mode={waveformMode} />
+              {isMuted && (
+                <button className="mute-badge" onClick={toggleMute} aria-label="Unmute">
+                  🔇 Muted — press Space to unmute
+                </button>
+              )}
+            </div>
+            <StatusBar
+              connectionState={connectionState}
+              isSessionActive={isSessionActive}
+              latencyMs={latencyMs}
+            />
           </div>
 
-          <StatusBar
-            connectionState={connectionState}
-            isSessionActive={isSessionActive}
-          />
-        </div>
+          <aside className="sidebar">
+            <NovaAvatar
+              isSpeaking={isSpeaking || isPlaying}
+              isConnected={connectionState === 'connected'}
+              isListening={isRecording && !isMuted && !isSpeaking && !isThinking}
+              isThinking={isThinking}
+            />
+            <Transcript messages={messages} isTyping={isTyping} />
+          </aside>
+        </main>
+      )}
 
-        {/* Right: Sidebar */}
-        <aside className="sidebar">
-          <NovaAvatar
-            isSpeaking={isSpeaking || isPlaying}
-            isConnected={connectionState === 'connected'}
-          />
-          <Transcript messages={messages} />
-        </aside>
-      </main>
+      {/* Session Summary Modal */}
+      <SessionSummary
+        isOpen={showSummary}
+        sessionDuration={sessionDuration}
+        exchangeCount={exchangeCount}
+        subject={subject}
+        messages={messages}
+        onNewSession={() => { setShowSummary(false); setMessages([]); }}
+        onClose={() => setShowSummary(false)}
+      />
+
+      {/* Keyboard shortcuts hint */}
+      {isSessionActive && (
+        <div className="keyboard-hint" aria-label="Keyboard shortcuts">
+          <span>⌨️ Space: mute/unmute · Esc: end session</span>
+        </div>
+      )}
     </div>
   );
 }
