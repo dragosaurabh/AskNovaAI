@@ -25,7 +25,9 @@ export default function useAudio({ onAudioChunk }) {
   const audioContextRef = useRef(null);
   const mediaStreamRef = useRef(null);
   const processorRef = useRef(null);
+  const [inputAnalyser, setInputAnalyser] = useState(null);
   const playbackContextRef = useRef(null);
+  const [outputAnalyser, setOutputAnalyser] = useState(null);
   const nextPlayTimeRef = useRef(0);
   const isPlayingRef = useRef(false);
   const activeSourcesRef = useRef(new Set());
@@ -58,6 +60,15 @@ export default function useAudio({ onAudioChunk }) {
 
       const source = audioContext.createMediaStreamSource(stream);
 
+      // Create AnalyserNode for real microphone waveform visualization
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 128; // Small size for fast, responsive drawing
+      analyser.smoothingTimeConstant = 0.8;
+      setInputAnalyser(analyser);
+
+      // Connect source to analyser for visualizer
+      source.connect(analyser);
+
       // Buffer size: power of 2 closest to 100ms at 16kHz
       const bufferSize = Math.pow(
         2,
@@ -68,9 +79,17 @@ export default function useAudio({ onAudioChunk }) {
 
       processor.onaudioprocess = (event) => {
         const inputData = event.inputBuffer.getChannelData(0);
+        
+        // Calculate volume for frontend VAD
+        let sum = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          sum += Math.abs(inputData[i]);
+        }
+        const volume = sum / inputData.length;
+
         // Convert Float32 → PCM 16-bit and send as raw ArrayBuffer
         const pcm16 = float32ToPCM16(inputData);
-        onAudioChunk?.(pcm16.buffer);
+        onAudioChunk?.(pcm16.buffer, volume);
       };
 
       source.connect(processor);
@@ -80,7 +99,7 @@ export default function useAudio({ onAudioChunk }) {
     } catch (err) {
       console.error('Microphone access failed:', err);
       if (err.name === 'NotAllowedError') {
-        setMicError('Microphone permission denied. Please allow access in your browser settings.');
+        setMicError('Please allow microphone access to talk to Nova');
       } else if (err.name === 'NotFoundError') {
         setMicError('No microphone found. Please connect a microphone.');
       } else {
@@ -105,6 +124,7 @@ export default function useAudio({ onAudioChunk }) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
     }
+    setInputAnalyser(null);
     setIsRecording(false);
   }, []);
 
@@ -119,6 +139,13 @@ export default function useAudio({ onAudioChunk }) {
         sampleRate: OUTPUT_SAMPLE_RATE,
       });
       nextPlayTimeRef.current = 0;
+
+      // Create shared AnalyserNode for Nova's voice visualization
+      const analyser = playbackContextRef.current.createAnalyser();
+      analyser.fftSize = 128;
+      analyser.smoothingTimeConstant = 0.8;
+      setOutputAnalyser(analyser);
+      analyser.connect(playbackContextRef.current.destination);
     }
 
     const ctx = playbackContextRef.current;
@@ -134,7 +161,12 @@ export default function useAudio({ onAudioChunk }) {
     // Schedule playback with precise timing (no gaps)
     const sourceNode = ctx.createBufferSource();
     sourceNode.buffer = audioBuffer;
-    sourceNode.connect(ctx.destination);
+    // Connect to analyser instead of directly to destination
+    if (outputAnalyser) {
+      sourceNode.connect(outputAnalyser);
+    } else {
+      sourceNode.connect(ctx.destination);
+    }
 
     const now = ctx.currentTime;
     const startTime = Math.max(now, nextPlayTimeRef.current);
@@ -157,7 +189,7 @@ export default function useAudio({ onAudioChunk }) {
         setIsPlaying(false);
       }
     };
-  }, []);
+  }, [outputAnalyser]);
 
   /**
    * Immediately stop all audio playback (for barge-in / interruption).
@@ -178,6 +210,7 @@ export default function useAudio({ onAudioChunk }) {
       playbackContextRef.current.close();
       playbackContextRef.current = null;
     }
+    setOutputAnalyser(null);
     nextPlayTimeRef.current = 0;
     isPlayingRef.current = false;
     setIsPlaying(false);
@@ -195,6 +228,8 @@ export default function useAudio({ onAudioChunk }) {
     isRecording,
     isPlaying,
     micError,
+    inputAnalyser,
+    outputAnalyser,
     startRecording,
     stopRecording,
     playAudioChunk,

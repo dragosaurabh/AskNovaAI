@@ -104,6 +104,8 @@ async def websocket_tutor(ws: WebSocket):
 
     gemini_session: GeminiLiveSession | None = None
     subject = "General"
+    voice = "Charon"
+    first_image_analyzed = False
 
     # ── Helper to send JSON safely ──
     async def send_json_safe(data: dict):
@@ -154,6 +156,7 @@ async def websocket_tutor(ws: WebSocket):
             on_turn_complete=on_turn_complete,
             on_interrupted=on_interrupted,
             subject=subject,
+            voice_name=voice,
         )
         await gemini_session.connect()
         await send_json_safe({"type": "connected"})
@@ -187,7 +190,8 @@ async def websocket_tutor(ws: WebSocket):
 
                 if msg_type == "config":
                     subject = data.get("subject", "General")
-                    logger.info("Subject set to: %s", subject)
+                    voice = data.get("voice", "Charon")
+                    logger.info("Subject set to: %s, Voice set to: %s", subject, voice)
                     try:
                         await create_and_connect_session()
                         break
@@ -210,8 +214,13 @@ async def websocket_tutor(ws: WebSocket):
         while gemini_session and gemini_session.is_connected:
             try:
                 message = await ws.receive()
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, RuntimeError):
                 logger.info("WebSocket disconnected.")
+                break
+
+            # Handle disconnect message type from Starlette
+            if message.get("type") == "websocket.disconnect":
+                logger.info("WebSocket disconnect message received.")
                 break
 
             # ── Binary frame = raw PCM audio (highest priority) ──
@@ -232,12 +241,29 @@ async def websocket_tutor(ws: WebSocket):
                 if msg_type == "image" and data.get("data"):
                     jpeg_bytes = base64.b64decode(data["data"])
                     await gemini_session.send_image(jpeg_bytes)
+                    
+                    if not first_image_analyzed:
+                        first_image_analyzed = True
+                        
+                        async def analyze_and_inject():
+                            try:
+                                logger.info("Analyzing initial frame with Pro model...")
+                                from app.gemini_client import analyze_frame
+                                analysis = await analyze_frame(data["data"], subject)
+                                logger.info("Analysis context generated: %s", analysis)
+                                await gemini_session.send_text(f"[System Context: The student's screen currently shows: {analysis}]")
+                            except Exception as e:
+                                logger.error("Pro analysis failed: %s", e)
+                                
+                        asyncio.create_task(analyze_and_inject())
 
                 elif msg_type == "config":
                     new_subject = data.get("subject", subject)
-                    if new_subject != subject:
+                    new_voice = data.get("voice", voice)
+                    if new_subject != subject or new_voice != voice:
                         subject = new_subject
-                        logger.info("Subject changed to: %s", subject)
+                        voice = new_voice
+                        logger.info("Subject/Voice config changed to: %s / %s", subject, voice)
 
     except Exception as e:
         logger.error("Unexpected error in WebSocket handler: %s", e, exc_info=True)

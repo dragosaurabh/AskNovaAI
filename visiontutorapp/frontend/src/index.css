@@ -439,6 +439,72 @@ body::before {
   min-height: 0;
 }
 
+/* ── Voice Selector ── */
+.voice-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+  margin-bottom: 8px;
+}
+
+.voice-selector__title {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+  text-align: center;
+}
+
+.voice-selector__pills {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.voice-pill {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 20px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-glass);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all var(--transition-normal);
+  text-align: center;
+}
+
+.voice-pill:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.voice-pill.active {
+  background: var(--primary-gradient);
+  border-color: transparent;
+  box-shadow: 0 4px 15px rgba(124, 58, 237, 0.3);
+}
+
+.voice-pill__label {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+}
+
+.voice-pill.active .voice-pill__label {
+  color: white;
+}
+
+.voice-pill__desc {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.voice-pill.active .voice-pill__desc {
+  color: rgba(255, 255, 255, 0.8);
+}
+
 /* ═══════════════════════════════════════════════════════
    Components
    ═══════════════════════════════════════════════════════ */

@@ -115,6 +115,27 @@ export default function useMedia({ onFrame }) {
   }, [startFrameCapture]);
 
   /**
+   * Stop all media streams and frame capture.
+   */
+  const stopMedia = useCallback(function stopMedia() {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    if (videoStreamRef.current) {
+      videoStreamRef.current.getTracks().forEach((track) => track.stop());
+      videoStreamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    prevFrameDataRef.current = null;
+    setIsActive(false);
+    setInputSource(null);
+    setSourceLabel('');
+  }, []);
+
+  /**
    * Start camera (webcam) mode.
    */
   const startCamera = useCallback(async () => {
@@ -125,10 +146,11 @@ export default function useMedia({ onFrame }) {
 
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: FRAME_WIDTH },
-          height: { ideal: FRAME_HEIGHT },
-          facingMode: 'environment',
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 1, max: 2 },
         },
+        audio: true
       });
 
       await attachStream(stream);
@@ -182,7 +204,7 @@ export default function useMedia({ onFrame }) {
         setMediaError(`Screen share error: ${err.message}`);
       }
     }
-  }, [attachStream]);
+  }, [attachStream, stopMedia]);
 
   /**
    * Start voice-only mode (no video).
@@ -192,27 +214,6 @@ export default function useMedia({ onFrame }) {
     setInputSource('voice');
     setSourceLabel('💬 Voice Only');
     setIsActive(true);
-  }, []);
-
-  /**
-   * Stop all media streams and frame capture.
-   */
-  const stopMedia = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-    if (videoStreamRef.current) {
-      videoStreamRef.current.getTracks().forEach((track) => track.stop());
-      videoStreamRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    prevFrameDataRef.current = null;
-    setIsActive(false);
-    setInputSource(null);
-    setSourceLabel('');
   }, []);
 
   // Cleanup on unmount

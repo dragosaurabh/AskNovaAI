@@ -56,6 +56,8 @@ export default function App() {
   const inputBufferRef = useRef('');
   const outputBufferRef = useRef('');
   const timeoutRef = useRef(null);
+  const currentTurnHasAudioRef = useRef(false);
+  const currentTurnHasInputRef = useRef(false);
 
   // Refs to avoid circular dependencies
   const handleEndSessionRef = useRef(null);
@@ -64,14 +66,14 @@ export default function App() {
   // ── Hooks ──
   const {
     connectionState, latencyMs, connect, disconnect, send, sendBinary,
-    setHandlers, markSpeechEnd,
+    setHandlers,
   } = useWebSocket();
 
-  // Audio chunk callback: send raw PCM binary
+  // Audio chunk callback: send raw PCM binary and volume for latency tracking
   const onAudioChunk = useCallback(
-    (arrayBuffer) => {
+    (arrayBuffer, volume) => {
       if (!isMuted) {
-        sendBinary(arrayBuffer);
+        sendBinary(arrayBuffer, volume);
       }
     },
     [sendBinary, isMuted]
@@ -79,6 +81,7 @@ export default function App() {
 
   const {
     isRecording, isPlaying, micError,
+    inputAnalyser, outputAnalyser,
     startRecording, stopRecording, playAudioChunk, stopPlayback,
   } = useAudio({ onAudioChunk });
 
@@ -141,15 +144,27 @@ export default function App() {
       onAudio: (arrayBuffer) => {
         playAudioChunk(arrayBuffer);
         setIsSpeaking(true);
-        setIsThinking(false); // Nova started responding
+        setIsThinking(false);
         setIsTyping(false);
+        // On first audio chunk of a turn, flush user input as a message
+        if (!currentTurnHasAudioRef.current) {
+          currentTurnHasAudioRef.current = true;
+          if (currentTurnHasInputRef.current || inputBufferRef.current.trim()) {
+            const userText = inputBufferRef.current.trim() || '🎤 Voice input';
+            setMessages((prev) => {
+              const updated = [...prev, { role: 'user', text: userText, timestamp: Date.now() }];
+              return updated.slice(-50);
+            });
+            inputBufferRef.current = '';
+            currentTurnHasInputRef.current = false;
+          }
+        }
         resetSessionTimeoutRef.current?.();
       },
       onInputTranscript: (text) => {
         inputBufferRef.current += text;
-        // User spoke — mark speech end for latency tracking
-        markSpeechEnd();
-        setIsThinking(true); // User finished speaking, waiting for Nova
+        currentTurnHasInputRef.current = true;
+        setIsThinking(true);
         resetSessionTimeoutRef.current?.();
       },
       onOutputTranscript: (text) => {
@@ -161,50 +176,55 @@ export default function App() {
         setIsSpeaking(false);
         setIsThinking(false);
         setIsTyping(false);
-        // Flush output buffer as a Nova message
-        if (outputBufferRef.current.trim()) {
-          setMessages((prev) => [
-            ...prev,
-            { role: 'nova', text: outputBufferRef.current.trim(), timestamp: Date.now() },
-          ]);
+        // Flush Nova message (use transcript or fallback)
+        const novaText = outputBufferRef.current.trim() || (currentTurnHasAudioRef.current ? '🔊 Audio response' : '');
+        if (novaText) {
+          setMessages((prev) => {
+            const updated = [...prev, { role: 'nova', text: novaText, timestamp: Date.now() }];
+            return updated.slice(-50);
+          });
           outputBufferRef.current = '';
           setExchangeCount((prev) => prev + 1);
         }
-        // Flush input buffer as a user message
+        // Flush any remaining user input
         if (inputBufferRef.current.trim()) {
-          setMessages((prev) => [
-            ...prev,
-            { role: 'user', text: inputBufferRef.current.trim(), timestamp: Date.now() },
-          ]);
+          setMessages((prev) => {
+            const updated = [...prev, { role: 'user', text: inputBufferRef.current.trim(), timestamp: Date.now() }];
+            return updated.slice(-50);
+          });
           inputBufferRef.current = '';
         }
+        // Reset turn tracking
+        currentTurnHasAudioRef.current = false;
+        currentTurnHasInputRef.current = false;
       },
       onInterrupted: () => {
         setIsSpeaking(false);
         setIsThinking(false);
         setIsTyping(false);
-        stopPlayback(); // Immediately stop Nova's audio
-        // Flash "Interrupted" briefly
+        stopPlayback();
         setWasInterrupted(true);
         setTimeout(() => setWasInterrupted(false), 1500);
-        // Flush any pending output
-        if (outputBufferRef.current.trim()) {
+        const novaText = outputBufferRef.current.trim();
+        if (novaText || currentTurnHasAudioRef.current) {
           setMessages((prev) => [
             ...prev,
-            { role: 'nova', text: outputBufferRef.current.trim() + ' [interrupted]', timestamp: Date.now() },
+            { role: 'nova', text: (novaText || '🔊 Audio') + ' [interrupted]', timestamp: Date.now() },
           ]);
-          outputBufferRef.current = '';
         }
+        outputBufferRef.current = '';
+        currentTurnHasAudioRef.current = false;
+        currentTurnHasInputRef.current = false;
       },
       onError: (msg) => {
         setError(msg);
       },
     });
-  }, [setHandlers, playAudioChunk, stopPlayback, markSpeechEnd]);
+  }, [setHandlers, playAudioChunk, stopPlayback]);
 
   // ── Start session ──
   const handleStartSession = useCallback(
-    async (source) => {
+    async (source, voice) => {
       setError(null);
       setMessages([]);
       setShowSummary(false);
@@ -222,7 +242,7 @@ export default function App() {
       }
 
       await startRecording();
-      connect(subject);
+      connect(subject, voice);
       setIsSessionActive(true);
     },
     [subject, connect, startCamera, startScreen, startVoiceOnly, startRecording]
@@ -306,7 +326,11 @@ export default function App() {
             <div className="controls-bar">
               <MicIndicator isActive={isRecording && !isMuted} />
               <TalkButton state={buttonState} onClick={isSessionActive ? handleEndSession : () => {}} />
-              <WaveformVisualizer mode={waveformMode} />
+              <WaveformVisualizer 
+                mode={waveformMode} 
+                inputAnalyser={inputAnalyser}
+                outputAnalyser={outputAnalyser}
+              />
               {isMuted && (
                 <button className="mute-badge" onClick={toggleMute} aria-label="Unmute">
                   🔇 Muted — press Space to unmute
@@ -326,8 +350,9 @@ export default function App() {
               isConnected={connectionState === 'connected'}
               isListening={isRecording && !isMuted && !isSpeaking && !isThinking}
               isThinking={isThinking}
+              outputAnalyser={outputAnalyser}
             />
-            <Transcript messages={messages} isTyping={isTyping} />
+            <Transcript messages={messages} isTyping={isTyping} isThinking={isThinking} />
           </aside>
         </main>
       )}

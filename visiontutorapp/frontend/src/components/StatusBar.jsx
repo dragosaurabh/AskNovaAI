@@ -7,41 +7,48 @@ import { formatTime } from '../utils/helpers';
 
 export default function StatusBar({ connectionState, isSessionActive, latencyMs }) {
   const [elapsed, setElapsed] = useState(0);
-  const intervalRef = useRef(null);
-  const prevSessionActive = useRef(false);
+  const startTimeRef = useRef(null);
 
-  // Session timer
+  // Session timer — starts counting when connected
   useEffect(() => {
-    if (isSessionActive && !prevSessionActive.current) {
-      // Session just started
-      setElapsed(0);
-      intervalRef.current = setInterval(() => {
-        setElapsed((prev) => prev + 1);
+    let interval = null;
+    if (isSessionActive && connectionState === 'connected') {
+      startTimeRef.current = Date.now();
+      interval = setInterval(() => {
+        const seconds = Math.floor((Date.now() - startTimeRef.current) / 1000);
+        setElapsed(seconds);
       }, 1000);
-    } else if (!isSessionActive && prevSessionActive.current) {
-      // Session just ended
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
+    } else {
+      // eslint-disable-next-line
+      setElapsed(0);
+      startTimeRef.current = null;
     }
-    prevSessionActive.current = isSessionActive;
+    
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (interval) clearInterval(interval);
     };
-  }, [isSessionActive]);
+  }, [isSessionActive, connectionState]);
 
   const isConnected = connectionState === 'connected';
   const isError = connectionState === 'error';
   const isConnecting = connectionState === 'connecting';
   const isDisconnected = connectionState === 'disconnected';
 
-  // Latency color
-  const latencyClass = latencyMs != null
-    ? latencyMs < 500 ? 'latency--good'
-      : latencyMs < 1000 ? 'latency--ok'
-        : 'latency--slow'
-    : '';
+  // Latency display: color coded based on response time
+  let latencyDisplay = '';
+  let latencyClass = '';
+  if (latencyMs != null && latencyMs > 0) {
+    if (latencyMs <= 600) {
+      latencyDisplay = `~${latencyMs}ms`;
+      latencyClass = 'latency--good'; // Green
+    } else if (latencyMs <= 1500) {
+      latencyDisplay = `~${latencyMs}ms`;
+      latencyClass = 'latency--ok'; // Yellow
+    } else {
+      latencyDisplay = `~${(latencyMs / 1000).toFixed(1)}s`;
+      latencyClass = 'latency--slow'; // Red
+    }
+  }
 
   return (
     <div className="status-bar" id="status-bar">
@@ -68,14 +75,19 @@ export default function StatusBar({ connectionState, isSessionActive, latencyMs 
           </>
         )}
         {/* Latency badge */}
-        {isConnected && latencyMs != null && (
+        {isConnected && latencyDisplay && (
           <span className={`status-bar__latency ${latencyClass}`}>
-            ~{latencyMs}ms
+            {latencyDisplay}
           </span>
         )}
       </div>
 
       <div className="status-bar__right">
+        {isConnected && (
+          <span className="status-bar__badge status-bar__badge--gemini">
+            ✨ Powered by Gemini 2.0
+          </span>
+        )}
         {isConnected && (
           <span className="status-bar__badge">
             <span>🔒</span>

@@ -5,27 +5,32 @@
  * - Binary frames for audio (no base64 overhead — 33% less data)
  * - JSON text frames for control messages
  * - Auto-reconnect with exponential backoff
- * - Latency tracking (time from user-stops-speaking → first audio chunk)
+ * - Latency tracking (time from last audio sent → first audio received)
+ * - Backpressure: skips audio sends if buffer piling up
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 
 const MAX_RECONNECT_DELAY = 16000;
-const INITIAL_RECONNECT_DELAY = 1000;
+const INITIAL_RECONNECT_DELAY = 2000;
+const MAX_BUFFERED_AMOUNT = 50000; // 50KB backpressure threshold
 
 export default function useWebSocket() {
   const [connectionState, setConnectionState] = useState('disconnected');
-  // disconnected | connecting | connected | error
   const [latencyMs, setLatencyMs] = useState(null);
 
   const wsRef = useRef(null);
+  const backupWsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY);
+  const reconnectAttemptsRef = useRef(0);
   const handlersRef = useRef({});
   const intentionalCloseRef = useRef(false);
 
-  // Latency tracking
+  // Latency & Frontend VAD tracking
   const speechEndTimeRef = useRef(null);
+  const isSpeakingRef = useRef(false);
+  const silenceTimerRef = useRef(null);
   const latencySamplesRef = useRef([]);
 
   /**
@@ -36,17 +41,20 @@ export default function useWebSocket() {
   }, []);
 
   /**
-   * Mark when user stops speaking (for latency measurement).
+   * Keep a warm backup connection ready in case of drop.
    */
-  const markSpeechEnd = useCallback(() => {
-    speechEndTimeRef.current = performance.now();
+  const prepareBackupConnection = useCallback(() => {
+    if (backupWsRef.current || intentionalCloseRef.current) return;
+    const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/tutor';
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    backupWsRef.current = ws;
   }, []);
 
   /**
    * Connect to the backend WebSocket.
    */
-  const connect = useCallback((subject = 'General') => {
-    // Clean up any existing connection
+  const connect = useCallback(function connect(subject = 'General', voice = 'Charon') {
     if (wsRef.current) {
       intentionalCloseRef.current = true;
       wsRef.current.close();
@@ -55,15 +63,33 @@ export default function useWebSocket() {
     intentionalCloseRef.current = false;
     setConnectionState('connecting');
 
-    const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/tutor';
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer'; // Receive binary as ArrayBuffer
+    // Use backup connection if available and open, else create new
+    let ws;
+    if (backupWsRef.current && backupWsRef.current.readyState === WebSocket.OPEN) {
+      ws = backupWsRef.current;
+      backupWsRef.current = null;
+    } else {
+      const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/tutor';
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+    }
+    
     wsRef.current = ws;
+    prepareBackupConnection();
+
+    // If we hot-swapped a connected socket, trigger onopen immediately
+    if (ws.readyState === WebSocket.OPEN && !ws.hasInitialized) {
+      ws.hasInitialized = true;
+      reconnectDelayRef.current = INITIAL_RECONNECT_DELAY;
+      reconnectAttemptsRef.current = 0;
+      ws.send(JSON.stringify({ type: 'config', subject, voice }));
+    }
 
     ws.onopen = () => {
+      ws.hasInitialized = true;
       reconnectDelayRef.current = INITIAL_RECONNECT_DELAY;
-      // Send config message with the selected subject (JSON)
-      ws.send(JSON.stringify({ type: 'config', subject }));
+      reconnectAttemptsRef.current = 0;
+      ws.send(JSON.stringify({ type: 'config', subject, voice }));
     };
 
     ws.onmessage = (event) => {
@@ -71,17 +97,25 @@ export default function useWebSocket() {
 
       // ── Binary frame = raw PCM audio from Nova ──
       if (event.data instanceof ArrayBuffer) {
-        // Measure latency: time from user stopped speaking to first audio chunk
+        // Measure latency: time from real speech end to first response chunk
         if (speechEndTimeRef.current) {
           const latency = Math.round(performance.now() - speechEndTimeRef.current);
-          speechEndTimeRef.current = null;
+          speechEndTimeRef.current = null; // Used it!
 
-          // Rolling average of last 5 samples
-          const samples = latencySamplesRef.current;
-          samples.push(latency);
-          if (samples.length > 5) samples.shift();
-          const avg = Math.round(samples.reduce((a, b) => a + b, 0) / samples.length);
-          setLatencyMs(avg);
+          // We got a response, no need to send silence ping anymore
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+
+          // Only record positive, reasonable values
+          if (latency > 0 && latency < 30000) {
+            const samples = latencySamplesRef.current;
+            samples.push(latency);
+            if (samples.length > 5) samples.shift();
+            const avg = Math.round(samples.reduce((a, b) => a + b, 0) / samples.length);
+            setLatencyMs(avg);
+          }
         }
 
         handlers.onAudio?.(event.data);
@@ -124,21 +158,35 @@ export default function useWebSocket() {
       setConnectionState('error');
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       wsRef.current = null;
-
       if (!intentionalCloseRef.current) {
         setConnectionState('disconnected');
+        
+        // Handle specific server-side disconnects (e.g., API key invalid / Model not found = 1008 or 1011)
+        if (event.code === 1008 || event.code === 1011) {
+          const handlers = handlersRef.current;
+          handlers.onError?.('Configuration error — contact support');
+          // Don't auto-reconnect if it's a hard auth/config error
+          return;
+        }
+
+        if (reconnectAttemptsRef.current >= 3) {
+          handlersRef.current.onError?.('Connection failed. Please refresh the page.');
+          return;
+        }
+
         const delay = reconnectDelayRef.current;
         reconnectTimeoutRef.current = setTimeout(() => {
-          reconnectDelayRef.current = Math.min(delay * 2, MAX_RECONNECT_DELAY);
-          connect(subject);
+          reconnectAttemptsRef.current += 1;
+          reconnectDelayRef.current = delay * 2;
+          connect(subject, handlersRef.current.lastRequestedVoice || 'Charon');
         }, delay);
       } else {
         setConnectionState('disconnected');
       }
     };
-  }, []);
+  }, [prepareBackupConnection]);
 
   /**
    * Send a JSON control message (config, image).
@@ -151,11 +199,36 @@ export default function useWebSocket() {
 
   /**
    * Send raw binary audio data (ArrayBuffer or TypedArray).
-   * Avoids base64 encoding — 33% less data over the wire.
+   * Includes VAD tracking for accurate latency measurements and fallback responses.
    */
-  const sendBinary = useCallback((data) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(data);
+  const sendBinary = useCallback((data, volume = 1.0) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Backpressure: don't send if too much buffered
+      if (ws.bufferedAmount < MAX_BUFFERED_AMOUNT) {
+        ws.send(data);
+        
+        // --- Frontend VAD Logic ---
+        if (volume >= 0.01) {
+          isSpeakingRef.current = true;
+          speechEndTimeRef.current = null; // Restart tracking
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+        } else if (isSpeakingRef.current && volume < 0.01) {
+          // Transition from speaking -> silence
+          isSpeakingRef.current = false;
+          speechEndTimeRef.current = performance.now();
+          
+          // Fallback: If no response in 3s, send ping to force generation
+          silenceTimerRef.current = setTimeout(() => {
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(new ArrayBuffer(320));
+            }
+          }, 3000);
+        }
+      }
     }
   }, []);
 
@@ -172,21 +245,29 @@ export default function useWebSocket() {
       wsRef.current.close();
       wsRef.current = null;
     }
+    if (backupWsRef.current) {
+      backupWsRef.current.close();
+      backupWsRef.current = null;
+    }
     setConnectionState('disconnected');
     setLatencyMs(null);
     latencySamplesRef.current = [];
+    speechEndTimeRef.current = null;
+    isSpeakingRef.current = false;
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
   }, []);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
       intentionalCloseRef.current = true;
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (wsRef.current) wsRef.current.close();
+      if (backupWsRef.current) backupWsRef.current.close();
     };
   }, []);
 
@@ -198,6 +279,5 @@ export default function useWebSocket() {
     send,
     sendBinary,
     setHandlers,
-    markSpeechEnd,
   };
 }
